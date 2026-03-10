@@ -17,3 +17,5 @@ export { QClawAPI } from "./qclaw-api.js";
 export { loadState, saveState, clearState } from "./state-store.js";
 export { performLogin } from "./wechat-login.js";
 export type { PerformLoginOptions } from "./wechat-login.js";
+export { buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./wechat-qr-poll.js";
+export type { QrPollResult } from "./wechat-qr-poll.js";

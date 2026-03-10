@@ -3,13 +3,25 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { WechatAccessWebSocketClient, handlePrompt, handleCancel } from "./websocket/index.js";
 // import { handleSimpleWecomWebhook } from "./http/webhook.js";
 import { setWecomRuntime } from "./common/runtime.js";
-import { performLogin, loadState, clearState, getDeviceGuid, getEnvironment } from "./auth/index.js";
+import { performLogin, loadState, clearState, saveState, getDeviceGuid, getEnvironment, QClawAPI, buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./auth/index.js";
+import type { QClawEnvironment, PersistedAuthState } from "./auth/index.js";
+import { nested } from "./auth/utils.js";
 
 // 类型定义
 type NormalizedChatType = "direct" | "group" | "channel";
 
 // WebSocket 客户端实例（按 accountId 存储）
 const wsClients = new Map<string, WechatAccessWebSocketClient>();
+
+// QR 扫码登录中间状态（loginWithQrStart 写入，loginWithQrWait 消费）
+let pendingQrLogin: {
+  state: string;
+  uuid: string;
+  env: QClawEnvironment;
+  guid: string;
+  bypassInvite: boolean;
+  authStatePath?: string;
+} | null = null;
 
 // 渠道元数据
 const meta = {
@@ -193,6 +205,123 @@ const tencentAccessPlugin = {
         log?.info(`[wechat-access] 账号 ${accountId} 已停止`);
       } else {
         log?.warn(`[wechat-access] stopAccount: 未找到账号 ${accountId} 的客户端`);
+      }
+    },
+
+    // QR 扫码登录：生成二维码（openclaw channels login 调用）
+    loginWithQrStart: async (_params: { accountId?: string; force?: boolean; timeoutMs?: number; verbose?: boolean }) => {
+      try {
+        const runtime = getWecomRuntime();
+        const cfg = runtime.config.loadConfig();
+        const channelCfg = cfg?.channels?.["wechat-access-unqclawed"];
+
+        const envName = channelCfg?.environment ? String(channelCfg.environment) : "production";
+        const bypassInvite = channelCfg?.bypassInvite === true;
+        const authStatePath = channelCfg?.authStatePath ? String(channelCfg.authStatePath) : undefined;
+
+        const env = getEnvironment(envName);
+        const guid = getDeviceGuid();
+
+        // 1. 获取 OAuth state
+        const api = new QClawAPI(env, guid);
+        const stateResult = await api.getWxLoginState();
+        let state = String(Math.floor(Math.random() * 10000));
+        if (stateResult.success) {
+          const s = nested(stateResult.data, "state") as string | undefined;
+          if (s) state = s;
+        }
+
+        // 2. 构造 auth URL → 抓取 QR 页面拿 uuid
+        const authUrl = buildAuthUrl(state, env);
+        const uuid = await fetchQrUuid(authUrl);
+
+        // 3. 拿 QR 图片转 base64 data URL
+        const qrDataUrl = await fetchQrImageDataUrl(uuid);
+
+        // 4. 存中间状态给 loginWithQrWait 用
+        pendingQrLogin = { state, uuid, env, guid, bypassInvite, authStatePath };
+
+        return { qrDataUrl, message: "请用微信扫描二维码登录" };
+      } catch (err) {
+        return { message: `登录初始化失败: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    },
+
+    // QR 扫码登录：轮询扫码状态（openclaw channels login 循环调用）
+    loginWithQrWait: async (_params: { accountId?: string; timeoutMs?: number }) => {
+      if (!pendingQrLogin) {
+        return { connected: false, message: "请先执行 loginWithQrStart" };
+      }
+
+      try {
+        const result = await pollQrStatus(pendingQrLogin.uuid);
+
+        if (result.status === "waiting") {
+          return { connected: false, message: "等待扫码..." };
+        }
+
+        if (result.status === "scanned") {
+          return { connected: false, message: "已扫码，请在手机上确认..." };
+        }
+
+        if (result.status === "expired") {
+          pendingQrLogin = null;
+          return { connected: false, message: "二维码已过期，请重新执行 openclaw channels login" };
+        }
+
+        if (result.status === "confirmed" && result.code) {
+          const { state, env, guid, authStatePath } = pendingQrLogin;
+          const api = new QClawAPI(env, guid);
+
+          // 用 code 换 token
+          const loginResult = await api.wxLogin(result.code, state);
+          if (!loginResult.success) {
+            pendingQrLogin = null;
+            return { connected: false, message: `登录失败: ${loginResult.message ?? "未知错误"}` };
+          }
+
+          const loginData = loginResult.data as Record<string, unknown>;
+          const jwtToken = (loginData.token as string) || "";
+          const channelToken = (loginData.openclaw_channel_token as string) || "";
+          const userInfo = (loginData.user_info as Record<string, unknown>) || {};
+
+          // 保存登录态
+          const persistedState: PersistedAuthState = {
+            jwtToken,
+            channelToken,
+            apiKey: "",
+            guid,
+            userInfo,
+            savedAt: Date.now(),
+          };
+          saveState(persistedState, authStatePath);
+
+          // 创建 API Key（非致命）
+          api.jwtToken = jwtToken;
+          api.userId = String(userInfo.user_id ?? "");
+          try {
+            const keyResult = await api.createApiKey();
+            if (keyResult.success) {
+              const apiKey =
+                (nested(keyResult.data, "key") as string) ??
+                (nested(keyResult.data, "resp", "data", "key") as string) ??
+                "";
+              if (apiKey) {
+                persistedState.apiKey = apiKey;
+                saveState(persistedState, authStatePath);
+              }
+            }
+          } catch { /* non-fatal */ }
+
+          pendingQrLogin = null;
+          const nickname = (userInfo.nickname as string) ?? "用户";
+          return { connected: true, message: `登录成功! 欢迎 ${nickname}，请重启 Gateway 生效。` };
+        }
+
+        // error 或其他未知状态
+        return { connected: false, message: "等待扫码..." };
+      } catch (err) {
+        return { connected: false, message: `轮询失败: ${err instanceof Error ? err.message : String(err)}` };
       }
     },
   },
