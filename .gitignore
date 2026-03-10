@@ -11,6 +11,9 @@ dist/
 .openclaw/
 .npmrc
 
+# Build output
+dist/
+
 # OS
 .DS_Store
 Thumbs.db

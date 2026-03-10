@@ -36,7 +36,10 @@ jobs:
           git push origin main --follow-tags
 
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm install
+
+      - name: Build
+        run: npm run build
 
       - name: Publish to npm
         run: npm publish --access public

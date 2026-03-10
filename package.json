@@ -9,19 +9,17 @@
     "type": "git",
     "url": "https://github.com/HenryXiaoYang/wechat-access-unqclawed.git"
   },
+  "scripts": {
+    "build": "tsup"
+  },
   "files": [
-    "index.ts",
-    "auth/",
-    "common/",
-    "http/",
-    "websocket/",
+    "dist/",
     "openclaw.plugin.json",
-    "websocket.md",
     "README.md"
   ],
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ],
     "channel": {
       "id": "wechat-access-unqclawed",
@@ -55,5 +53,9 @@
   },
   "peerDependencies": {
     "openclaw": ">=2026.1.26"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
   }
 }
