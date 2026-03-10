@@ -3,7 +3,7 @@ import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { WechatAccessWebSocketClient, handlePrompt, handleCancel } from "./websocket/index.js";
 // import { handleSimpleWecomWebhook } from "./http/webhook.js";
 import { setWecomRuntime, getWecomRuntime } from "./common/runtime.js";
-import { performLogin, loadState, clearState, saveState, getDeviceGuid, getEnvironment, QClawAPI, TokenExpiredError, buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./auth/index.js";
+import { performLogin, performDeviceBinding, loadState, clearState, saveState, getDeviceGuid, getEnvironment, QClawAPI, TokenExpiredError, buildAuthUrl, fetchQrUuid, fetchQrImageDataUrl, pollQrStatus } from "./auth/index.js";
 import type { QClawEnvironment, PersistedAuthState } from "./auth/index.js";
 import { nested } from "./auth/utils.js";
 
@@ -211,65 +211,29 @@ const tencentAccessPlugin = {
           }
         } catch { /* non-fatal */ }
 
-        // 7. 生成企微客服链接，等待设备绑定（非致命，token 已拿到）
+        // 7. 设备绑定：生成企微客服链接，用户在微信中打开后才有对话入口
         try {
-          const OPEN_KFID = "wkzLlJLAAAfbxEV3ZcS-lHZxkaKmpejQ";
-          runtime.log("\n[wechat-access] 生成企微客服链接...");
-          const linkResult = await api.generateContactLink(OPEN_KFID);
-
-          if (!linkResult.success) {
-            runtime.log(`[wechat-access] 生成链接失败: ${linkResult.message ?? "未知错误"}（跳过设备绑定）`);
-          } else {
-            const linkData = linkResult.data as Record<string, unknown>;
-            const contactUrl =
-              (nested(linkData, "url") as string) ||
-              (nested(linkData, "data", "url") as string) ||
-              "";
-
-            if (!contactUrl) {
-              runtime.log("[wechat-access] 返回数据中没有 URL（跳过设备绑定）");
-            } else {
-              runtime.log("=".repeat(60));
-              runtime.log("  用微信扫描下方二维码，进入客服对话完成设备绑定");
-              runtime.log("=".repeat(60));
-
+          const runtimeLog = {
+            info: (...args: unknown[]) => runtime.log(...args),
+            warn: (...args: unknown[]) => runtime.log(...args),
+            error: (...args: unknown[]) => runtime.log(...args),
+          };
+          const bindResult = await performDeviceBinding({
+            api,
+            log: runtimeLog,
+            showQr: async (url: string) => {
               try {
                 const qrterm = await import("qrcode-terminal");
                 const generate = qrterm.default?.generate ?? qrterm.generate;
-                generate(contactUrl, { small: true }, (qrcode: string) => {
+                generate(url, { small: true }, (qrcode: string) => {
                   runtime.log("\n" + qrcode);
                 });
               } catch {
                 runtime.log("(qrcode-terminal 不可用)");
               }
-              runtime.log(`\n或手动打开: ${contactUrl}\n`);
-
-              // 轮询等待绑定
-              runtime.log("[wechat-access] 等待微信扫码绑定 (超时 5 分钟)...");
-              const bindDeadline = Date.now() + 300_000;
-              let deviceBound = false;
-              while (Date.now() < bindDeadline) {
-                await new Promise((r) => setTimeout(r, 2000));
-                try {
-                  const status = await api.queryDeviceByGuid();
-                  if (status.success) {
-                    const sd = status.data as Record<string, unknown>;
-                    const nick =
-                      (nested(sd, "nickname") as string) ||
-                      (nested(sd, "data", "nickname") as string);
-                    if (nick) {
-                      runtime.log(`[wechat-access] 设备绑定成功! 微信昵称: ${nick}`);
-                      deviceBound = true;
-                      break;
-                    }
-                  }
-                } catch { /* continue polling */ }
-              }
-              if (!deviceBound) {
-                runtime.log("[wechat-access] 设备绑定超时，可稍后重新执行 channels login");
-              }
-            }
-          }
+            },
+          });
+          runtime.log(`[wechat-access] ${bindResult.message}`);
         } catch (e) {
           runtime.log(`[wechat-access] 设备绑定失败（非致命）: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -609,9 +573,30 @@ const tencentAccessPlugin = {
           // 备份到独立文件（兜底）
           saveState({ jwtToken, channelToken, apiKey, guid, userInfo, savedAt: Date.now() }, authStatePath);
 
+          // 生成设备绑定链接（非致命）
+          let bindUrl = "";
+          try {
+            const OPEN_KFID = "wkzLlJLAAAfbxEV3ZcS-lHZxkaKmpejQ";
+            const linkResult = await api.generateContactLink(OPEN_KFID);
+            if (linkResult.success) {
+              const linkData = linkResult.data as Record<string, unknown>;
+              bindUrl =
+                (nested(linkData, "url") as string) ||
+                (nested(linkData, "data", "url") as string) ||
+                "";
+            }
+          } catch { /* non-fatal */ }
+
           pendingQrLogin = null;
           const nickname = (userInfo.nickname as string) ?? "用户";
-          return { connected: true, message: `登录成功! 欢迎 ${nickname}，请重启 Gateway 生效。` };
+          const bindHint = bindUrl
+            ? `\n\n⚠️ 请在微信中打开以下链接完成设备绑定（绑定后才有对话入口）：\n${bindUrl}`
+            : "";
+          return {
+            connected: true,
+            bindUrl: bindUrl || undefined,
+            message: `登录成功! 欢迎 ${nickname}，请重启 Gateway 生效。${bindHint}`,
+          };
         }
 
         // error 或其他未知状态

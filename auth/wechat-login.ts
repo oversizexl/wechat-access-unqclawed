@@ -11,6 +11,7 @@ import type { QClawEnvironment, LoginCredentials, PersistedAuthState } from "./t
 import { QClawAPI } from "./qclaw-api.js";
 import { saveState } from "./state-store.js";
 import { nested } from "./utils.js";
+import { performDeviceBinding } from "./device-bind.js";
 
 /** 构造微信 OAuth2 授权 URL */
 const buildAuthUrl = (state: string, env: QClawEnvironment): string => {
@@ -233,6 +234,19 @@ export const performLogin = async (options: PerformLoginOptions): Promise<LoginC
   };
   saveState(persistedState, authStatePath);
   info("[Login] 登录态已保存");
+
+  // 设备绑定：生成企微客服链接，用户在微信中打开后才有对话入口
+  info("[Login] 开始设备绑定...");
+  const bindResult = await performDeviceBinding({
+    api,
+    log: log ?? { info: console.log, warn: console.warn, error: console.error },
+  });
+  if (bindResult.success) {
+    info(`[Login] ${bindResult.message}`);
+  } else {
+    warn(`[Login] ${bindResult.message}`);
+    warn("[Login] 可稍后重新执行登录命令完成绑定。");
+  }
 
   return credentials;
 };
